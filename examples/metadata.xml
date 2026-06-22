@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ModelMetadata version="1">
+  <SRS>EPSG:4547</SRS>
+  <Origin X="500000.0" Y="3000000.0" Z="0.0"/>
+  <SpatialReferenceSystem>
+    <Name>CGCS2000 / 3-degree Gauss-Kruger CM 117E</Name>
+    <WKT>PROJCS["CGCS2000 / 3-degree Gauss-Kruger CM 117E",GEOGCS["CGCS2000",DATUM["China_2000",SPHEROID["CGCS2000",6378137,298.257222101]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]],PROJECTION["Transverse_Mercator"],PARAMETER["latitude_of_origin",0],PARAMETER["central_meridian",117],PARAMETER["scale_factor",1],PARAMETER["false_easting",500000],PARAMETER["false_northing",0],UNIT["metre",1]]</WKT>
+  </SpatialReferenceSystem>
+  <BoundingBox>
+    <Min X="499500.0" Y="2999500.0" Z="0.0"/>
+    <Max X="500500.0" Y="3000500.0" Z="200.0"/>
+  </BoundingBox>
+</ModelMetadata>
