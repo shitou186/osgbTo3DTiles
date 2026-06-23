@@ -105,6 +105,14 @@ def main():
         help="启用 Draco 网格压缩",
     )
 
+    # 输出格式版本
+    parser.add_argument(
+        "--format-version",
+        choices=["1.0", "1.1"],
+        default="1.1",
+        help="3D Tiles 输出版本：1.0 (b3dm) 或 1.1 (glb，默认)",
+    )
+
     # LOD 与简化参数
     parser.add_argument(
         "--enable-lod",
@@ -177,6 +185,7 @@ def main():
         enable_simplify=args.enable_simplify,
         lod_levels=lod_levels,
         simplify_error=args.simplify_error,
+        tiles_version=args.format_version,
     )
 
     try:
@@ -234,6 +243,13 @@ def _print_pipeline_config(config: ConvertConfig):
     """打印流水线参数联动状态。"""
     print()
     print("  ── 流水线配置 ──")
+    print(f"  格式版本:   3D Tiles {config.tiles_version}", end="")
+    if config.tiles_version == "1.0":
+        print("  (b3dm 封装)", end="")
+    else:
+        print("  (glb 直出)", end="")
+    print()
+
     print(f"  LOD:        {'启用' if config.enable_lod else '禁用'}", end="")
     if config.enable_lod:
         print(f"  级别: {config.lod_levels}", end="")

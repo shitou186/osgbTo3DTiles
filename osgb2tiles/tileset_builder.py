@@ -13,6 +13,7 @@ import numpy as np
 
 from .config import ConvertConfig, RefineMode
 from .gltf_assembler import GlbAssembler, pack_glb
+from .b3dm import package_to_b3dm
 from .metadata import OsgeMetadata, local_to_ecef_transform
 from .osgb_parser import OsgeTileNode, OsgeBinaryParser, OsgeMesh, PageLODInfo, compute_geometric_error
 from .structure import StructureType, resolve_pagelod_path, extract_level_from_filename, compute_level_based_error
@@ -49,7 +50,7 @@ class TilesetBuilder:
 
         tileset = {
             "asset": {
-                "version": "1.1",
+                "version": self.config.tiles_version,
                 "generator": "OSGB2Tiles v1.0",
             },
             "geometricError": root_error,
@@ -107,17 +108,18 @@ class TilesetBuilder:
         # ── 标准路径：无 LOD ──
         use_draco = self.config.mesh_compression
         glb_bytes = self._assemble_glb(meshes, tile_name, use_draco)
+        tile_bytes = self._package_tile(glb_bytes)
 
         self.tile_counter += 1
-        glb_name = f"{tile_name}_{self.tile_counter:04d}.glb"
-        glb_path = os.path.join("tiles", glb_name)
+        tile_name_str = f"{tile_name}_{self.tile_counter:04d}{self._tile_extension}"
+        tile_rel_path = os.path.join("tiles", tile_name_str)
 
-        full_path = os.path.join(output_dir, glb_path)
+        full_path = os.path.join(output_dir, tile_rel_path)
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
         with open(full_path, "wb") as f:
-            f.write(glb_bytes)
+            f.write(tile_bytes)
 
-        return {"content": {"uri": glb_path}}
+        return {"content": {"uri": tile_rel_path}}
 
     def _build_lod_tree(
         self,
@@ -178,18 +180,19 @@ class TilesetBuilder:
             else:
                 use_draco = self.config.mesh_compression
 
-            # 生成 GLB
+            # 生成 GLB 并封装
             glb_bytes = self._assemble_glb(level_meshes, tile_name, use_draco)
+            tile_bytes = self._package_tile(glb_bytes)
 
             self.tile_counter += 1
             suffix = f"lod{level_idx}"
-            glb_name = f"{tile_name}_{suffix}_{self.tile_counter:04d}.glb"
-            glb_path = os.path.join("tiles", glb_name)
+            tile_name_str = f"{tile_name}_{suffix}_{self.tile_counter:04d}{self._tile_extension}"
+            tile_rel_path = os.path.join("tiles", tile_name_str)
 
-            full_path = os.path.join(output_dir, glb_path)
+            full_path = os.path.join(output_dir, tile_rel_path)
             os.makedirs(os.path.dirname(full_path), exist_ok=True)
             with open(full_path, "wb") as f:
-                f.write(glb_bytes)
+                f.write(tile_bytes)
 
             # 计算几何误差
             if level_idx == 0:
@@ -200,13 +203,13 @@ class TilesetBuilder:
 
             tri_count = sum(len(m.indices) // 3 for m in level_meshes)
             draco_tag = "+Draco" if use_draco else ""
-            print(f" → LOD{level_idx}: {glb_name} ({len(glb_bytes)/1024:.1f}KB, {tri_count}tris {draco_tag})")
+            print(f" → LOD{level_idx}: {tile_name_str} ({len(tile_bytes)/1024:.1f}KB, {tri_count}tris {draco_tag})")
 
             tiles_by_level.append({
                 "geometricError": round(geo_error, 2),
                 "refine": self.config.refine_mode.value,
                 "boundingVolume": self._compute_bounding_volume_from_meshes(level_meshes),
-                "content": {"uri": glb_path},
+                "content": {"uri": tile_rel_path},
             })
 
         # 倒置树组装：Root → children → grandchildren
@@ -317,14 +320,15 @@ class TilesetBuilder:
                 glb_bytes = self._assemble_glb(
                     node.meshes, node.name, self.config.mesh_compression
                 )
-                glb_name = self._unique_name(node.name)
-                glb_rel = os.path.join("tiles", glb_name)
-                full_path = os.path.join(output_dir, glb_rel)
+                tile_bytes = self._package_tile(glb_bytes)
+                tile_name_str = self._unique_name(node.name)
+                tile_rel = os.path.join("tiles", tile_name_str)
+                full_path = os.path.join(output_dir, tile_rel)
                 os.makedirs(os.path.dirname(full_path), exist_ok=True)
                 with open(full_path, "wb") as f:
-                    f.write(glb_bytes)
-                tile["content"] = {"uri": glb_rel}
-                print(f" → GLB: {glb_name} ({len(glb_bytes) / 1024:.1f}KB)")
+                    f.write(tile_bytes)
+                tile["content"] = {"uri": tile_rel}
+                print(f" → {tile_name_str} ({len(tile_bytes) / 1024:.1f}KB)")
         else:
             print()
 
@@ -417,6 +421,21 @@ class TilesetBuilder:
         return 1000.0
 
     def _unique_name(self, base_name: str) -> str:
-        """生成唯一的 GLB 文件名。"""
+        """生成唯一的瓦片文件名。"""
         stem = os.path.splitext(base_name)[0]
-        return f"{stem}_{self.tile_counter:04d}.glb"
+        return f"{stem}_{self.tile_counter:04d}{self._tile_extension}"
+
+    @property
+    def _tile_extension(self) -> str:
+        """根据版本返回瓦片文件扩展名。"""
+        return ".b3dm" if self.config.tiles_version == "1.0" else ".glb"
+
+    def _package_tile(self, glb_bytes: bytes) -> bytes:
+        """根据版本将 glb 数据封装为最终瓦片格式。
+
+        1.0 → b3dm 封装
+        1.1 → 直接使用 glb
+        """
+        if self.config.tiles_version == "1.0":
+            return package_to_b3dm(glb_bytes)
+        return glb_bytes

@@ -34,6 +34,9 @@ class ConvertConfig:
     lod_levels: List[float] = field(default_factory=lambda: [1.0, 0.5, 0.25])
     simplify_error: float = 0.01
 
+    # 输出格式版本
+    tiles_version: str = "1.1"  # "1.0" (b3dm) 或 "1.1" (glb)
+
     def validate(self):
         if self.back_face_culling and self.force_double_sided:
             raise ValueError("back_face_culling 与 force_double_sided 互斥")
