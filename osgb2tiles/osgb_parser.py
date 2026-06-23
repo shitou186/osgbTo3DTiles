@@ -292,10 +292,14 @@ class OsgeBinaryParser:
     def _extract_dji_child_names(data: bytes) -> list:
         """从 DJI OSGB 文件中提取子文件名引用。
 
-        搜索格式：uint32长度 + 数字字符串.osgb
+        搜索两种格式：
+        1. uint32长度 + 数字字符串.osgb（DJI Terra 格式）
+        2. 路径形式的 .osgb 引用（ContextCapture 分幅格式，含相对路径 ../）
         """
         import re
         results = []
+
+        # 格式1：纯数字文件名（DJI Terra）
         for m in re.finditer(rb"(\d{12,}\.osgb)", data):
             name = m.group().decode("ascii")
             pos = m.start()
@@ -303,6 +307,18 @@ class OsgeBinaryParser:
                 plen = struct.unpack_from("<I", data, pos - 4)[0]
                 if plen == len(name) and name not in results:
                     results.append(name)
+
+        # 格式2：路径形式的 .osgb 引用（ContextCapture 分幅）
+        # 匹配如: ../Level_19/Tile_+000_+000.osgb, top/Level_18/Tile_xxx.osgb
+        if not results:
+            for m in re.finditer(rb"([\w/+._ -]+\.osgb)", data):
+                name = m.group().decode("ascii", errors="replace")
+                pos = m.start()
+                if pos >= 4:
+                    plen = struct.unpack_from("<I", data, pos - 4)[0]
+                    if plen == len(name) and name not in results:
+                        results.append(name)
+
         return results
 
     def _read_node(self, data: bytes, offset: int) -> Tuple[OsgeTileNode, int]:

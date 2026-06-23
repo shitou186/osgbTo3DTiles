@@ -81,20 +81,31 @@ def detect_structure(input_dir: str) -> StructureType:
     """自动检测 OSGB 数据目录的结构类型。
 
     检测策略：
-    1. 存在 Data.osgb → ContextCapture
+    1. 存在 Data.osgb 或 tileset.osgb → ContextCapture
     2. 存在 Base/ 子目录 → ContextCapture
-    3. Data/ 下有单个数字命名子目录，内含纯数字 .osgb 文件 → DJI Terra
-    4. 以上均不匹配 → 抛出异常
+    3. 存在 Tile_+xxx_+xxx 分幅子目录（内含 _L 层级文件）→ ContextCapture
+    4. Data/ 下有单个数字命名子目录，内含纯数字 .osgb 文件 → DJI Terra
+    5. 以上均不匹配 → 抛出异常
     """
     data_dir = find_data_dir(input_dir)
 
-    # ContextCapture: Data.osgb
-    if os.path.exists(os.path.join(data_dir, "Data.osgb")):
-        return StructureType.CONTEXT_CAPTURE
+    # ContextCapture: Data.osgb 或 tileset.osgb
+    for root_name in ("Data.osgb", "tileset.osgb"):
+        if os.path.exists(os.path.join(data_dir, root_name)):
+            return StructureType.CONTEXT_CAPTURE
 
     # ContextCapture: Base/ 子目录
     if os.path.isdir(os.path.join(data_dir, "Base")):
         return StructureType.CONTEXT_CAPTURE
+
+    # ContextCapture: 存在 Tile_+xxx_+xxx 分幅子目录
+    for entry in os.listdir(data_dir):
+        entry_path = os.path.join(data_dir, entry)
+        if os.path.isdir(entry_path) and entry.startswith("Tile_"):
+            # 检查子目录中是否有带 _L 层级标识的 .osgb 文件
+            for f in os.listdir(entry_path):
+                if f.lower().endswith(".osgb") and _LEVEL_PATTERN.search(f):
+                    return StructureType.CONTEXT_CAPTURE
 
     # DJI Terra: 目录中有纯数字命名的 .osgb 文件
     osgb_files = [
@@ -111,7 +122,7 @@ def detect_structure(input_dir: str) -> StructureType:
 
     raise ValueError(
         f"无法识别 {input_dir} 的 OSGB 数据目录结构。"
-        f"请确认目录中包含 Data.osgb 或纯数字命名的 .osgb 文件。"
+        f"请确认目录中包含 Data.osgb、tileset.osgb 或纯数字命名的 .osgb 文件。"
     )
 
 
@@ -124,10 +135,11 @@ def find_root_osgb(input_dir: str, structure_type: StructureType) -> str:
     data_dir = find_data_dir(input_dir)
 
     if structure_type == StructureType.CONTEXT_CAPTURE:
-        root = os.path.join(data_dir, "Data.osgb")
-        if os.path.exists(root):
-            return root
-        # 回退：目录中唯一的 .osgb
+        # 优先 Data.osgb，回退 tileset.osgb，最后回退目录中唯一 .osgb
+        for root_name in ("Data.osgb", "tileset.osgb"):
+            root = os.path.join(data_dir, root_name)
+            if os.path.exists(root):
+                return root
         osgb_files = [
             f for f in os.listdir(data_dir)
             if f.lower().endswith(".osgb") and os.path.isfile(os.path.join(data_dir, f))
@@ -135,7 +147,7 @@ def find_root_osgb(input_dir: str, structure_type: StructureType) -> str:
         if len(osgb_files) == 1:
             return os.path.join(data_dir, osgb_files[0])
         raise FileNotFoundError(
-            f"在 {data_dir} 中未找到 Data.osgb。"
+            f"在 {data_dir} 中未找到 Data.osgb 或 tileset.osgb。"
         )
 
     # DJI Terra: 最短文件名
