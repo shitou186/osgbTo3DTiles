@@ -115,7 +115,7 @@ class GlbAssembler:
         primitive: Dict = {"attributes": {}, "extensions": {}}
 
         if self.config.mesh_compression:
-            return self._process_mesh_draco(mesh, bin_buffer, buffer_views, primitive, gltf)
+            return self._process_mesh_draco(mesh, bin_buffer, buffer_views, accessors, primitive, gltf)
 
         # ---- POSITION ----
         if len(mesh.vertices) > 0:
@@ -175,57 +175,98 @@ class GlbAssembler:
         mesh: OsgeMesh,
         bin_buffer: BytesIO,
         buffer_views: List[dict],
+        accessors: List[dict],
         primitive: dict,
         gltf: dict,
     ) -> dict:
-        """使用 Draco 压缩网格数据。"""
+        """使用 Draco 压缩网格数据。
+
+        glTF 2.0 + KHR_draco_mesh_compression 规范要求：
+        1. primitive.attributes 中必须保留 POSITION/NORMAL/TEXCOORD_0 的 accessor 索引
+           （这些 accessor 需要包含 count、min、max，但不需要 bufferView）
+        2. primitive.indices 必须指向一个有效的 accessor（同上）
+        3. Draco 扩展的 attributes 映射属性 ID → decoder attribute ID
+        """
         try:
-            from draco.encoder import Encoder
+            import DracoPy
         except ImportError:
             raise RuntimeError(
-                "Draco 压缩需要 draco 库。请安装：pip install draco"
+                "Draco 压缩需要 DracoPy 库。请安装：pip install DracoPy"
             )
 
-        encoder = Encoder()
-        encoder.SetAttribute(0, mesh.vertices)
-        if len(mesh.normals) > 0:
-            encoder.SetAttribute(1, mesh.normals)
-        if len(mesh.uvs) > 0:
-            encoder.SetAttribute(2, mesh.uvs)
-        if len(mesh.indices) > 0:
-            encoder.SetFaces(mesh.indices.reshape(-1, 3))
-
-        draco_data = encoder.EncodeToBytes()
+        draco_data = DracoPy.encode(
+            points=mesh.vertices.astype(np.float64) if len(mesh.vertices) > 0 else [],
+            faces=mesh.indices.reshape(-1, 3).astype(np.int64) if len(mesh.indices) > 0 else None,
+            normals=mesh.normals.astype(np.float64) if len(mesh.normals) > 0 else None,
+            tex_coord=mesh.uvs.astype(np.float64) if len(mesh.uvs) > 0 else None,
+            quantization_bits=11,
+            compression_level=1,
+        )
 
         bv_idx = self._write_buffer_view(
             bin_buffer, buffer_views, draco_data, target=None
         )
 
+        # Draco 扩展引用
         primitive["extensions"]["KHR_draco_mesh_compression"] = {
             "bufferView": bv_idx,
             "attributes": {},
         }
         attr_map = primitive["extensions"]["KHR_draco_mesh_compression"]["attributes"]
+
+        # 创建各属性的 accessor（Draco 要求原始 attributes 仍指向有效 accessor）
+        # accessor 提供 count/min/max 信息，bufferView 设为 null（数据在 Draco 中）
+
         if len(mesh.vertices) > 0:
+            acc_idx = len(accessors)
+            accessors.append({
+                "componentType": 5126,  # FLOAT
+                "count": len(mesh.vertices),
+                "type": "VEC3",
+                "max": mesh.vertices.max(axis=0).tolist(),
+                "min": mesh.vertices.min(axis=0).tolist(),
+            })
+            primitive["attributes"]["POSITION"] = acc_idx
             attr_map["POSITION"] = 0
+
         if len(mesh.normals) > 0:
+            acc_idx = len(accessors)
+            accessors.append({
+                "componentType": 5126,
+                "count": len(mesh.normals),
+                "type": "VEC3",
+            })
+            primitive["attributes"]["NORMAL"] = acc_idx
             attr_map["NORMAL"] = 1
+
         if len(mesh.uvs) > 0:
+            acc_idx = len(accessors)
+            accessors.append({
+                "componentType": 5126,
+                "count": len(mesh.uvs),
+                "type": "VEC2",
+            })
+            primitive["attributes"]["TEXCOORD_0"] = acc_idx
             attr_map["TEXCOORD_0"] = 2
 
-        gltf["extensionsUsed"].append("KHR_draco_mesh_compression")
-        gltf["extensionsRequired"].append("KHR_draco_mesh_compression")
-
-        # 仍需写入索引 accessor（Draco 解码后需要）
         if len(mesh.indices) > 0:
             if mesh.indices.max() <= 65535:
-                component_type = 5123
+                component_type = 5123  # UNSIGNED_SHORT
             else:
-                component_type = 5125
-            primitive["indices"] = len(accessors := gltf.get("accessors", []))
+                component_type = 5125  # UNSIGNED_INT
+            acc_idx = len(accessors)
+            accessors.append({
+                "componentType": component_type,
+                "count": len(mesh.indices),
+                "type": "SCALAR",
+            })
+            primitive["indices"] = acc_idx
 
         if not primitive["extensions"]:
             del primitive["extensions"]
+
+        gltf["extensionsUsed"].append("KHR_draco_mesh_compression")
+        gltf["extensionsRequired"].append("KHR_draco_mesh_compression")
 
         return primitive
 

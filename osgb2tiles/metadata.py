@@ -85,3 +85,39 @@ def local_to_ecef_transform(metadata: OsgeMetadata) -> np.ndarray:
         dtype=np.float64,
     )
     return matrix
+
+
+def local_to_wgs84_transform(metadata: OsgeMetadata) -> np.ndarray:
+    """计算从局部 ENU 坐标到 WGS84 的 4x4 变换矩阵。"""
+    lon_rad = math.radians(metadata.origin_lon)
+    lat_rad = math.radians(metadata.origin_lat)
+    cos_lat = math.cos(lat_rad)
+    sin_lat = math.sin(lat_rad)
+    cos_lon = math.cos(lon_rad)
+    sin_lon = math.sin(lon_rad)
+
+    matrix = np.array(
+        [
+            [-sin_lon, -sin_lat * cos_lon, cos_lat * cos_lon, metadata.origin_lon],
+            [cos_lon, -sin_lat * sin_lon, cos_lat * sin_lon, metadata.origin_lat],
+            [0.0, cos_lat, sin_lat, metadata.origin_height],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    return matrix
+
+
+def bbox_center_lonlat(bounding_volume: dict) -> tuple:
+    """从 3D Tiles boundingVolume 提取中心点坐标。
+
+    支持 box 和 sphere 两种格式。
+    返回 (x_center, y_center)，用于四叉树空间排序。
+    """
+    if "box" in bounding_volume:
+        box = bounding_volume["box"]
+        return (float(box[0]), float(box[1]))
+    elif "sphere" in bounding_volume:
+        s = bounding_volume["sphere"]
+        return (float(s[0]), float(s[1]))
+    return (0.0, 0.0)
