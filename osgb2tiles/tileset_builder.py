@@ -132,7 +132,11 @@ class TilesetBuilder:
             print(f"  子 tileset: {tile_subdir}/ ({glb_count} 瓦片)")
 
         # 生成根 tileset.json
-        root_error = self._compute_root_error(root_node)
+        # 从子 tileset 误差推导根误差，确保父子递减（2:1）
+        if sub_tileset_refs:
+            root_error = max(ref["geometricError"] for ref in sub_tileset_refs) * 2.0
+        else:
+            root_error = self._compute_root_error(root_node)
         # 合并所有子 tileset 的包围体作为根包围体
         all_bvs = [ref["boundingVolume"] for ref in sub_tileset_refs if "boundingVolume" in ref]
         root_bv = self._merge_bounding_volumes(all_bvs) if all_bvs else {"sphere": [0, 0, 0, 1]}
@@ -314,10 +318,23 @@ class TilesetBuilder:
             offset = max(level - self._base_level, 0)
             tile["geometricError"] = max(base_error * (0.5 ** offset), 0.01)
         elif node.page_lods:
-            # 根节点或无 _Lxx_ → 使用 range_max
-            tile["geometricError"] = compute_geometric_error(
-                node.page_lods[0], self.config.geometric_error_scale
-            )
+            if depth == 0:
+                # 子 tileset 根节点：从包围体计算误差（比子节点 L17 粗一级）
+                # 保证与 L17 等子节点形成 2:1 的 geometricError 递减
+                bv = tile.get("boundingVolume", {})
+                if "box" in bv:
+                    b = bv["box"]
+                    base_error = (abs(b[3]) + abs(b[7]) + abs(b[11])) / 3.0
+                elif "sphere" in bv:
+                    base_error = bv["sphere"][3]
+                else:
+                    base_error = 100.0
+                tile["geometricError"] = max(base_error * 2.0, 0.01)
+            else:
+                # 根节点或无 _Lxx_ → 使用 range_max 作为回退
+                tile["geometricError"] = compute_geometric_error(
+                    node.page_lods[0], self.config.geometric_error_scale
+                )
         else:
             # 叶子节点
             level = extract_level_from_filename(
@@ -601,5 +618,3 @@ class TilesetBuilder:
     def _tile_extension(self) -> str:
         """根据版本返回瓦片文件扩展名。"""
         return ".b3dm" if self.config.tiles_version == "1.0" else ".glb"
-
-
