@@ -39,6 +39,7 @@ class OsgeMesh:
     indices: np.ndarray    # (M,) uint32
     texture_path: Optional[str] = None
     texture_data: Optional[bytes] = None
+    lod_texture_size: Optional[int] = None  # LOD 级别对应的纹理尺寸
 
 
 @dataclass

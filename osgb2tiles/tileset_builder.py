@@ -12,8 +12,7 @@ from typing import List, Optional
 import numpy as np
 
 from .config import ConvertConfig, RefineMode
-from .gltf_assembler import GlbAssembler, pack_glb
-from .b3dm import package_to_b3dm
+from .gltf_assembler import GlbAssembler
 from .metadata import OsgeMetadata, local_to_ecef_transform, bbox_center_lonlat
 from .osgb_parser import OsgeTileNode, OsgeBinaryParser, OsgeMesh, PageLODInfo, compute_geometric_error
 from .spatial_quadtree import TileRecord
@@ -34,54 +33,177 @@ class TilesetBuilder:
         self.assembler = GlbAssembler(config)
         self.tile_counter = 0
         self._root_name_length = 0
+        self._base_level = 0  # 文件名中 _Lxx_ 的最小层级
+        self._range_max_uniform = True  # 所有 PagedLOD 的 range_max 是否相同
 
     def build(self, root_osgb: str, output_dir: str):
-        """主入口：从根 OSGB 文件构建完整 3D Tiles 输出。"""
+        """主入口：从根 OSGB 文件构建完整 3D Tiles 输出。
+
+        输出结构：
+        output_dir/
+          tileset.json              (根 tileset，children 指向子 tileset)
+          Data/
+            Tile_+000_+000/
+              tileset.json          (子 tileset，包含完整瓦片树)
+              *.glb / *.b3dm        (瓦片文件)
+            Tile_+000_+001/
+              ...
+        """
         os.makedirs(output_dir, exist_ok=True)
-        os.makedirs(os.path.join(output_dir, "tiles"), exist_ok=True)
+        data_dir = os.path.join(output_dir, "Data")
+        os.makedirs(data_dir, exist_ok=True)
 
         if self.structure_type == StructureType.DJI_TERRA:
             self._root_name_length = len(os.path.splitext(os.path.basename(root_osgb))[0])
 
         print(f"  解析根文件: {os.path.basename(root_osgb)}")
         root_node = self.parser.parse_file(root_osgb)
-        root_tile = self._process_node(root_node, root_osgb, output_dir, depth=0)
 
-        # 阶段一：当 enable_lod 且顶层 children 过多时，触发四叉树空间重构
-        root_children = root_tile.get("children", [])
-        if self.config.enable_lod and len(root_children) > 4:
-            from .top_level_reconstructor import reconstruct_top_levels
-            leaf_tiles = self._collect_leaf_tiles(root_tile, output_dir)
-            if len(leaf_tiles) > 4:
-                reconstructed = reconstruct_top_levels(
-                    leaf_tiles, self.config, self.assembler, output_dir,
-                    tile_counter_start=self.tile_counter,
+        # 预扫描：提取基准层级 & 检测 range_max 是否一致
+        self._base_level, self._range_max_uniform = self._scan_level_range(root_node)
+
+        # 收集顶层瓦片组，为每个生成独立子 tileset
+        osgb_dir = os.path.dirname(root_osgb)
+        top_level_paths = []
+
+        # 从 PagedLOD 收集顶层子节点路径
+        for pagelod in root_node.page_lods:
+            child_path = resolve_pagelod_path(
+                osgb_dir, pagelod.child_tile_path, self.structure_type, root_osgb
+            )
+            if os.path.exists(child_path):
+                top_level_paths.append(child_path)
+
+        # 如果根只有一个子节点（中间容器），递归找到真正的顶层瓦片组
+        if len(top_level_paths) == 1:
+            container_node = self.parser.parse_file(top_level_paths[0])
+            container_dir = os.path.dirname(top_level_paths[0])
+            deeper_paths = []
+            for pagelod in container_node.page_lods:
+                child_path = resolve_pagelod_path(
+                    container_dir, pagelod.child_tile_path, self.structure_type, top_level_paths[0]
                 )
-                if reconstructed:
-                    root_tile = reconstructed
-                    # 根节点保留 ECEF 变换
-                    if self.config.ecef_transform:
-                        root_tile["transform"] = self.ecef_matrix.T.flatten().tolist()
+                if os.path.exists(child_path):
+                    deeper_paths.append(child_path)
+            if deeper_paths:
+                top_level_paths = deeper_paths
 
+        sub_tileset_refs = []
+
+        for child_osgb_path in top_level_paths:
+            tile_name = os.path.splitext(os.path.basename(child_osgb_path))[0]
+            tile_subdir = os.path.join("Data", tile_name)
+            os.makedirs(os.path.join(output_dir, tile_subdir), exist_ok=True)
+
+            # 优先使用 Data/<tile_name>/ 目录下的同名文件（包含完整层级链）
+            alt_path = os.path.join(osgb_dir, tile_name, os.path.basename(child_osgb_path))
+            if os.path.exists(alt_path):
+                child_osgb_path = alt_path
+
+            child_node = self.parser.parse_file(child_osgb_path)
+            self._load_mesh_textures(child_node, os.path.dirname(child_osgb_path))
+            sub_tile = self._process_node(
+                child_node, child_osgb_path, output_dir, depth=0,
+                tile_subdir=tile_subdir,
+            )
+
+            # 生成子 tileset.json（移除 transform，避免重复坐标变换）
+            sub_tile.pop("transform", None)
+            sub_tileset = {
+                "asset": {
+                    "version": self.config.tiles_version,
+                    "generator": "OSGB2Tiles v1.0",
+                    "gltfUpAxis": "Z",
+                },
+                "geometricError": sub_tile.get("geometricError", 1000),
+                "root": sub_tile,
+            }
+            sub_ts_path = os.path.join(output_dir, tile_subdir, "tileset.json")
+            with open(sub_ts_path, "w", encoding="utf-8") as f:
+                json.dump(sub_tileset, f, indent=2, ensure_ascii=False)
+
+            sub_tileset_refs.append({
+                "boundingVolume": sub_tile.get("boundingVolume", {}),
+                "geometricError": sub_tile.get("geometricError", 1000),
+                "content": {"uri": f"./{tile_subdir}/tileset.json"},
+            })
+
+            glb_count = self._count_glb_files(sub_tile)
+            print(f"  子 tileset: {tile_subdir}/ ({glb_count} 瓦片)")
+
+        # 生成根 tileset.json
         root_error = self._compute_root_error(root_node)
-
-        tileset = {
+        # 合并所有子 tileset 的包围体作为根包围体
+        all_bvs = [ref["boundingVolume"] for ref in sub_tileset_refs if "boundingVolume" in ref]
+        root_bv = self._merge_bounding_volumes(all_bvs) if all_bvs else {"sphere": [0, 0, 0, 1]}
+        root_tileset = {
             "asset": {
                 "version": self.config.tiles_version,
                 "generator": "OSGB2Tiles v1.0",
             },
             "geometricError": root_error,
-            "root": root_tile,
+            "root": {
+                "boundingVolume": root_bv,
+                "geometricError": root_error,
+                "refine": self.config.refine_mode.value,
+                "children": sub_tileset_refs,
+            },
         }
+
+        # 根节点应用 ECEF 变换
+        if self.config.ecef_transform:
+            root_tileset["root"]["transform"] = self.ecef_matrix.T.flatten().tolist()
 
         tileset_path = os.path.join(output_dir, "tileset.json")
         with open(tileset_path, "w", encoding="utf-8") as f:
-            json.dump(tileset, f, indent=2, ensure_ascii=False)
+            json.dump(root_tileset, f, indent=2, ensure_ascii=False)
 
         return tileset_path
 
+    def _merge_bounding_volumes(self, bvs: list) -> dict:
+        """合并多个包围体为一个大的包围盒。"""
+        import numpy as np
+        if not bvs:
+            return {"sphere": [0, 0, 0, 1]}
+        all_centers = []
+        all_half_sizes = []
+        for bv in bvs:
+            if "box" in bv:
+                b = bv["box"]
+                all_centers.append([b[0], b[1], b[2]])
+                all_half_sizes.append([b[3], b[7], b[11]])
+            elif "sphere" in bv:
+                s = bv["sphere"]
+                all_centers.append([s[0], s[1], s[2]])
+                all_half_sizes.append([s[3], s[3], s[3]])
+        if not all_centers:
+            return {"sphere": [0, 0, 0, 1]}
+        centers = np.array(all_centers)
+        half_sizes = np.array(all_half_sizes)
+        min_corner = (centers - half_sizes).min(axis=0)
+        max_corner = (centers + half_sizes).max(axis=0)
+        center = (min_corner + max_corner) / 2.0
+        half = (max_corner - min_corner) / 2.0
+        return {
+            "box": [
+                float(center[0]), float(center[1]), float(center[2]),
+                float(half[0]), 0.0, 0.0,
+                0.0, float(half[1]), 0.0,
+                0.0, 0.0, float(half[2]),
+            ]
+        }
+
+    def _count_glb_files(self, tile: dict) -> int:
+        """递归统计瓦片树中的 GLB/B3DM 文件数。"""
+        count = 0
+        if "content" in tile:
+            count += 1
+        for child in tile.get("children", []):
+            count += self._count_glb_files(child)
+        return count
+
     # ─────────────────────────────────────────────
-    #  核心流水线：LOD × 简化 × Draco 联动状态机
+    #  流水线委托（已迁移至 pipeline.py）
     # ─────────────────────────────────────────────
 
     def process_mesh_pipeline(
@@ -91,180 +213,57 @@ class TilesetBuilder:
         output_dir: str,
         parent_geometric_error: float,
     ) -> dict:
-        """多参数联动核心调度函数。
-
-        根据 enable_lod / enable_simplify / mesh_compression 的组合，
-        决定生成单级或多级 GLB，并组装 3D Tiles 子树。
-
-        联动矩阵：
-        ┌─────────┬──────────────┬─────────┬────────────────────────────────┐
-        │  LOD    │  simplify    │ draco   │  行为                          │
-        ├─────────┼──────────────┼─────────┼────────────────────────────────┤
-        │  ON     │  ON          │ ON/OFF  │ 情况A: 多级自适应简化           │
-        │  ON     │  OFF         │ ON/OFF  │ 情况B: 多级结构，不简化          │
-        │  OFF    │  ON          │ ON/OFF  │ 单级简化（无层级树）             │
-        │  OFF    │  OFF         │ ON/OFF  │ 标准转换                       │
-        └─────────┴──────────────┴─────────┴────────────────────────────────┘
-
-        Draco 条件联动（情况C，仅 LOD 开启时生效）：
-        - LOD0（最高质量）：不压缩，避免近景精度损失
-        - LOD1/LOD2：应用 Draco 压缩，减小中远景瓦片体积
-
-        Returns:
-            3D Tiles tile dict（可能包含 children 子树）
-        """
+        """多参数联动核心调度函数（委托给 OptimizationPipeline）。"""
         if not meshes:
             return {}
 
-        # ── 情况 A/B：LOD 开启 → 生成多级子树 ──
-        if self.config.enable_lod:
-            return self._build_lod_tree(
-                meshes, tile_name, output_dir, parent_geometric_error
-            )
+        from .pipeline import OptimizationPipeline, PipelineContext, TileWorkItem
 
-        # ── 标准路径：无 LOD ──
-        use_draco = self.config.mesh_compression
-        glb_bytes = self._assemble_glb(meshes, tile_name, use_draco)
-        tile_bytes = self._package_tile(glb_bytes)
+        work = TileWorkItem(
+            tile_id=self.tile_counter,
+            osgb_path="",
+            tile_name=tile_name,
+            output_dir=output_dir,
+            tile_subdir="tiles",
+            depth=0,
+            parent_geometric_error=parent_geometric_error,
+        )
+        ctx = PipelineContext(
+            config=self.config,
+            metadata=self.metadata,
+            structure_type=self.structure_type,
+            ecef_matrix=self.ecef_matrix,
+            assembler=self.assembler,
+            tile_counter=self.tile_counter,
+        )
+        pipeline = OptimizationPipeline(ctx)
+        results = pipeline.process_tile(work, self.parser)
+        self.tile_counter = ctx.tile_counter
 
-        self.tile_counter += 1
-        tile_name_str = f"{tile_name}_{self.tile_counter:04d}{self._tile_extension}"
-        tile_rel_path = os.path.join("tiles", tile_name_str)
+        if not results:
+            return {}
 
-        full_path = os.path.join(output_dir, tile_rel_path)
-        os.makedirs(os.path.dirname(full_path), exist_ok=True)
-        with open(full_path, "wb") as f:
-            f.write(tile_bytes)
-
-        return {"content": {"uri": tile_rel_path}}
-
-    def _build_lod_tree(
-        self,
-        meshes: List[OsgeMesh],
-        tile_name: str,
-        output_dir: str,
-        parent_geometric_error: float,
-    ) -> dict:
-        """构建 LOD 倒置树结构。
-
-        3D Tiles 1.1 LOD 映射：
-        - Root 节点 = LOD（最低细节，geometricError 最大，远景加载）
-        - 叶子节点 = LOD0（最高细节，geometricError=0，近景加载）
-
-        情况A（enable_simplify=True）：各层级网格经 meshoptimizer 简化
-        情况B（enable_simplify=False）：各层级网格相同，仅结构分层
-        """
-        from .mesh_simplifier import generate_lod_meshes
-
-        lod_levels = self.config.lod_levels  # [1.0, 0.5, 0.25] 高→低
-        n_levels = len(lod_levels)
-
-        # 为每个原始网格生成多级 LOD
-        all_lod_meshes = []  # [lod_level_idx] = [SimplifyResult per mesh]
-        for mesh in meshes:
-            lod_results = generate_lod_meshes(
-                mesh.vertices, mesh.normals, mesh.uvs, mesh.indices,
-                lod_ratios=lod_levels,
-                target_error=self.config.simplify_error,
-            )
-            # 继承纹理数据
-            for result in lod_results:
-                result.texture_data = mesh.texture_data
-                result.texture_path = mesh.texture_path
-            all_lod_meshes.append(lod_results)
-
-        # 从最低精度到最高精度，构建倒置树
-        # 最低精度(lod_levels[-1]) → Root，最高精度(lod_levels[0]) → Leaf
-        tiles_by_level = []
-
-        for level_idx in range(n_levels - 1, -1, -1):
-            level_meshes = []
-            for mesh_lods in all_lod_meshes:
-                result = mesh_lods[level_idx]
-                level_meshes.append(OsgeMesh(
-                    vertices=result.vertices,
-                    normals=result.normals,
-                    uvs=result.uvs,
-                    indices=result.indices,
-                    texture_data=result.texture_data,
-                    texture_path=result.texture_path,
-                ))
-
-            # 情况C：LOD0 不压缩，LOD1+ 压缩
-            is_highest_detail = (level_idx == 0)
-            if self.config.mesh_compression and self.config.enable_lod:
-                use_draco = not is_highest_detail
-            else:
-                use_draco = self.config.mesh_compression
-
-            # 生成 GLB 并封装
-            glb_bytes = self._assemble_glb(level_meshes, tile_name, use_draco)
-            tile_bytes = self._package_tile(glb_bytes)
-
-            self.tile_counter += 1
-            suffix = f"lod{level_idx}"
-            tile_name_str = f"{tile_name}_{suffix}_{self.tile_counter:04d}{self._tile_extension}"
-            tile_rel_path = os.path.join("tiles", tile_name_str)
-
-            full_path = os.path.join(output_dir, tile_rel_path)
+        # 写入瓦片文件
+        for r in results:
+            full_path = os.path.join(output_dir, r.tile_rel_path)
             os.makedirs(os.path.dirname(full_path), exist_ok=True)
             with open(full_path, "wb") as f:
-                f.write(tile_bytes)
+                f.write(r.tile_bytes)
 
-            # 计算几何误差
-            if level_idx == 0:
-                geo_error = 0.0  # LOD0（叶子）：近景加载，误差为 0
-            else:
-                # 按级别递减：级别越高（越粗糙）误差越大
-                geo_error = parent_geometric_error * (1.0 / lod_levels[level_idx])
-
-            tri_count = sum(len(m.indices) // 3 for m in level_meshes)
-            draco_tag = "+Draco" if use_draco else ""
-            print(f" → LOD{level_idx}: {tile_name_str} ({len(tile_bytes)/1024:.1f}KB, {tri_count}tris {draco_tag})")
-
-            tiles_by_level.append({
-                "geometricError": round(geo_error, 2),
-                "refine": self.config.refine_mode.value,
-                "boundingVolume": self._compute_bounding_volume_from_meshes(level_meshes),
-                "content": {"uri": tile_rel_path},
-            })
-
-        # 倒置树组装：Root → children → grandchildren
-        # tiles_by_level[0] = LODn-1 (最粗糙) = Root
-        # tiles_by_level[-1] = LOD0 (最精细) = Leaf
-        root_tile = tiles_by_level[0]
-        current = root_tile
-        for i in range(1, len(tiles_by_level)):
-            child = tiles_by_level[i]
-            # 子节点继承 refine
-            child["refine"] = self.config.refine_mode.value
-            current["children"] = [child]
-            current = child
-
-        return root_tile
+        # 组装返回值
+        if self.config.enable_lod and len(results) > 1:
+            # 构建嵌套 LOD 树
+            reversed_results = list(reversed(results))
+            root_tile_json = reversed_results[0].tile_json
+            current = root_tile_json
+            for r in reversed_results[1:]:
+                current["children"] = [r.tile_json]
+                current = r.tile_json
+            return root_tile_json
+        return results[0].tile_json
 
     # ─────────────────────────────────────────────
-    #  GLB 组装（支持 Draco 条件控制）
-    # ─────────────────────────────────────────────
-
-    def _assemble_glb(
-        self,
-        meshes: List[OsgeMesh],
-        tile_name: str,
-        use_draco: bool,
-    ) -> bytes:
-        """组装 GLB 二进制，支持按需选择 Draco 压缩。"""
-        # 临时覆盖 assembler 的压缩配置
-        original_compression = self.assembler.config.mesh_compression
-        self.assembler.config.mesh_compression = use_draco
-        try:
-            gltf_json, bin_data = self.assembler.build_gltf(meshes, tile_name=tile_name)
-            return pack_glb(gltf_json, bin_data)
-        finally:
-            self.assembler.config.mesh_compression = original_compression
-
-    # ─────────────────────────────────────────────
-    #  标准节点处理（无 LOD 时的原有逻辑）
+    #  标准节点处理
     # ─────────────────────────────────────────────
 
     def _process_node(
@@ -273,8 +272,13 @@ class TilesetBuilder:
         osgb_path: str,
         output_dir: str,
         depth: int,
+        tile_subdir: str = "tiles",
     ) -> dict:
-        """递归处理单个节点，生成 tile JSON + GLB 内容。"""
+        """递归处理单个节点，生成 tile JSON + GLB 内容。
+
+        Args:
+            tile_subdir: GLB 文件输出子目录（如 'Data/Tile_+000_+000'）
+        """
         tile = {}
 
         self.tile_counter += 1
@@ -287,12 +291,35 @@ class TilesetBuilder:
         # 1. 包围体
         tile["boundingVolume"] = self._compute_bounding_volume(node)
 
-        # 2. 几何误差
-        if node.page_lods:
+        # 2. 几何误差（基于文件名 _Lxx_ 层级标识的指数衰减）
+        # 参考工具使用包围体平均半尺寸作为 base_error，0.5 为每级衰减因子
+        level = self._extract_lod_level(osgb_path)
+        if level is None and node.page_lods:
+            # 文件名无 _Lxx_ → 从子节点推断层级
+            child_level = self._extract_lod_level_from_path(node.page_lods[0].child_tile_path)
+            if child_level is not None:
+                level = child_level
+        if level is not None and depth > 0:
+            # 非根节点且有 _Lxx_ → 从包围体计算 base_error 并衰减
+            bv = tile.get("boundingVolume", {})
+            if "box" in bv:
+                b = bv["box"]
+                base_error = (abs(b[3]) + abs(b[7]) + abs(b[11])) / 3.0
+            elif "sphere" in bv:
+                base_error = bv["sphere"][3]
+            else:
+                base_error = 100.0
+            if self._base_level <= 0:
+                self._base_level = level
+            offset = max(level - self._base_level, 0)
+            tile["geometricError"] = max(base_error * (0.5 ** offset), 0.01)
+        elif node.page_lods:
+            # 根节点或无 _Lxx_ → 使用 range_max
             tile["geometricError"] = compute_geometric_error(
                 node.page_lods[0], self.config.geometric_error_scale
             )
         else:
+            # 叶子节点
             level = extract_level_from_filename(
                 os.path.basename(osgb_path), self.structure_type, self._root_name_length
             )
@@ -314,46 +341,11 @@ class TilesetBuilder:
         osgb_dir = os.path.dirname(osgb_path)
         self._load_mesh_textures(node, osgb_dir)
 
-        # 6. 生成 GLB（LOD 或标准模式）
-        if node.meshes:
-            parent_error = tile["geometricError"]
-
-            if self.config.enable_lod:
-                # LOD 模式：使用 pipeline 生成多级子树
-                lod_tile = self.process_mesh_pipeline(
-                    node.meshes, node.name, output_dir, parent_error
-                )
-                # 将 LOD 子树的 content 或 children 合并到当前 tile
-                if "children" in lod_tile:
-                    tile["children"] = lod_tile["children"]
-                if "content" in lod_tile:
-                    tile["content"] = lod_tile["content"]
-
-                # LOD 根节点使用原始 geometricError
-                if "geometricError" in lod_tile:
-                    tile["geometricError"] = lod_tile["geometricError"]
-            else:
-                # 标准模式
-                glb_bytes = self._assemble_glb(
-                    node.meshes, node.name, self.config.mesh_compression
-                )
-                tile_bytes = self._package_tile(glb_bytes)
-                tile_name_str = self._unique_name(node.name)
-                tile_rel = os.path.join("tiles", tile_name_str)
-                full_path = os.path.join(output_dir, tile_rel)
-                os.makedirs(os.path.dirname(full_path), exist_ok=True)
-                with open(full_path, "wb") as f:
-                    f.write(tile_bytes)
-                tile["content"] = {"uri": tile_rel}
-                print(f" → {tile_name_str} ({len(tile_bytes) / 1024:.1f}KB)")
-        else:
-            print()
-
-        # 7. 递归子节点
-        children = []
+        # 6. 递归处理 OSGB PagedLOD 子节点（先于 LOD 树构建）
+        osgb_children = []
         for child in node.children:
-            child_tile = self._process_node(child, osgb_path, output_dir, depth + 1)
-            children.append(child_tile)
+            child_tile = self._process_node(child, osgb_path, output_dir, depth + 1, tile_subdir)
+            osgb_children.append(child_tile)
 
         for pagelod in node.page_lods:
             child_path = resolve_pagelod_path(
@@ -361,13 +353,67 @@ class TilesetBuilder:
             )
             if os.path.exists(child_path):
                 child_node = self.parser.parse_file(child_path)
-                child_tile = self._process_node(child_node, child_path, output_dir, depth + 1)
-                children.append(child_tile)
+                child_tile = self._process_node(child_node, child_path, output_dir, depth + 1, tile_subdir)
+                osgb_children.append(child_tile)
 
-        if children:
-            # 如果已有 LOD children，合并
-            existing = tile.get("children", [])
-            tile["children"] = existing + children
+        # 7. 生成 GLB（委托给 OptimizationPipeline）
+        if node.meshes:
+            from .pipeline import OptimizationPipeline, PipelineContext, TileWorkItem
+
+            work = TileWorkItem(
+                tile_id=self.tile_counter,
+                osgb_path=osgb_path,
+                tile_name=node.name,
+                output_dir=output_dir,
+                tile_subdir=tile_subdir,
+                depth=depth,
+                parent_geometric_error=tile.get("geometricError", 100),
+            )
+            ctx = PipelineContext(
+                config=self.config,
+                metadata=self.metadata,
+                structure_type=self.structure_type,
+                ecef_matrix=self.ecef_matrix,
+                assembler=self.assembler,
+                tile_counter=self.tile_counter,
+            )
+            pipeline = OptimizationPipeline(ctx)
+            results = pipeline.process_tile(work, self.parser)
+            self.tile_counter = ctx.tile_counter
+
+            if results:
+                # 写入瓦片文件
+                for r in results:
+                    full_path = os.path.join(output_dir, tile_subdir, r.tile_rel_path)
+                    os.makedirs(os.path.dirname(full_path), exist_ok=True)
+                    with open(full_path, "wb") as f:
+                        f.write(r.tile_bytes)
+
+                # 组装 tile JSON
+                if self.config.enable_lod and len(results) > 1:
+                    # 构建嵌套 LOD 树：Root（最粗糙）→ Leaf（最精细）
+                    # results 顺序：[LOD0, LOD1, LOD2]（从高精度到低精度）
+                    # 嵌套：LOD2(Root) → LOD1 → LOD0(Leaf)
+                    reversed_results = list(reversed(results))
+                    root_tile_json = reversed_results[0].tile_json
+                    current = root_tile_json
+                    for r in reversed_results[1:]:
+                        current["children"] = [r.tile_json]
+                        current = r.tile_json
+                    if osgb_children:
+                        current["children"] = current.get("children", []) + osgb_children
+                    tile.update(root_tile_json)
+                else:
+                    tile["content"] = results[0].tile_json.get("content")
+                    if osgb_children:
+                        tile["children"] = osgb_children
+            else:
+                if osgb_children:
+                    tile["children"] = osgb_children
+        else:
+            print()
+            if osgb_children:
+                tile["children"] = osgb_children
 
         return tile
 
@@ -438,6 +484,51 @@ class TilesetBuilder:
     # ─────────────────────────────────────────────
     #  辅助方法
     # ─────────────────────────────────────────────
+
+    def _extract_lod_level(self, osgb_path: str) -> Optional[int]:
+        """从文件名中提取 _Lxx_ 层级标识。"""
+        return extract_level_from_filename(
+            os.path.basename(osgb_path), self.structure_type, self._root_name_length
+        )
+
+    def _extract_lod_level_from_path(self, child_tile_path: str) -> Optional[int]:
+        """从 PagedLOD 子路径中提取 _Lxx_ 层级标识。"""
+        return extract_level_from_filename(
+            os.path.basename(child_tile_path), self.structure_type, self._root_name_length
+        )
+
+    def _scan_level_range(self, node: OsgeTileNode) -> tuple:
+        """预扫描瓦片树，提取基准层级和 range_max 一致性。
+
+        Returns:
+            (base_level, range_max_is_uniform)
+        """
+        levels = []
+        range_max_values = []
+        self._collect_scan_data(node, levels, range_max_values)
+
+        base_level = min(levels) if levels else 0
+        uniform = len(set(range_max_values)) <= 1 if range_max_values else True
+        return base_level, uniform
+
+    def _collect_scan_data(
+        self, node: OsgeTileNode, levels: list, range_max_values: list
+    ):
+        """递归收集层级标识和 range_max 值。"""
+        for child in node.children:
+            self._collect_scan_data(child, levels, range_max_values)
+
+        for pagelod in node.page_lods:
+            range_max_values.append(pagelod.range_max)
+            osgb_dir = ''  # 路径在预扫描时不可用，仅需文件名
+            child_path = pagelod.child_tile_path
+            level = extract_level_from_filename(
+                os.path.basename(child_path), self.structure_type, self._root_name_length
+            )
+            if level is not None:
+                levels.append(level)
+            # 预扫描仅收集第一层子节点的 range_max 和 level
+            # 不深入递归，避免重复加载
 
     def _load_mesh_textures(self, node: OsgeTileNode, osgb_dir: str):
         """为节点中的网格加载纹理数据。"""
@@ -511,12 +602,4 @@ class TilesetBuilder:
         """根据版本返回瓦片文件扩展名。"""
         return ".b3dm" if self.config.tiles_version == "1.0" else ".glb"
 
-    def _package_tile(self, glb_bytes: bytes) -> bytes:
-        """根据版本将 glb 数据封装为最终瓦片格式。
 
-        1.0 → b3dm 封装
-        1.1 → 直接使用 glb
-        """
-        if self.config.tiles_version == "1.0":
-            return package_to_b3dm(glb_bytes)
-        return glb_bytes

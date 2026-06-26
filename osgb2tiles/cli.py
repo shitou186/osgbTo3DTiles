@@ -43,8 +43,8 @@ def main():
 示例:
   python -m osgb2tiles -i ./Data -o ./output
   python -m osgb2tiles -i ./Data -o ./output --texture webp --no-unlit
-  python -m osgb2tiles -i ./Data -o ./output --draco --texture ktx2 --double-sided
-  python -m osgb2tiles -i ./Data -o ./output --enable-lod --enable-simplify --draco
+  python -m osgb2tiles -i ./Data -o ./output --enable-draco --enable-texture-compress --double-sided
+  python -m osgb2tiles -i ./Data -o ./output --enable-lod --enable-simplify --enable-draco
 """,
     )
 
@@ -99,10 +99,20 @@ def main():
 
     # 网格压缩
     parser.add_argument(
+        "--enable-draco",
         "--draco",
         action="store_true",
         default=False,
-        help="启用 Draco 网格压缩",
+        dest="enable_draco",
+        help="启用 Draco 网格压缩（LOD 模式下 LOD0 自动跳过压缩）",
+    )
+
+    # 纹理压缩
+    parser.add_argument(
+        "--enable-texture-compress",
+        action="store_true",
+        default=False,
+        help="启用 KTX2 纹理压缩（需要 toktx 工具）",
     )
 
     # 输出格式版本
@@ -175,7 +185,7 @@ def main():
         force_double_sided=args.double_sided,
         unlit_shading=args.unlit,
         texture_format=TextureFormat(args.texture),
-        mesh_compression=args.draco,
+        mesh_compression=args.enable_draco,
         refine_mode=RefineMode(args.refine),
         geometric_error_scale=args.error_scale,
         max_texture_size=args.max_texture_size,
@@ -185,6 +195,8 @@ def main():
         enable_simplify=args.enable_simplify,
         lod_levels=lod_levels,
         simplify_error=args.simplify_error,
+        enable_draco=args.enable_draco,
+        enable_texture_compress=args.enable_texture_compress,
         tiles_version=args.format_version,
     )
 
@@ -260,16 +272,23 @@ def _print_pipeline_config(config: ConvertConfig):
         print(f"  误差: {config.simplify_error}", end="")
     print()
 
-    print(f"  Draco:      {'启用' if config.mesh_compression else '禁用'}", end="")
-    if config.enable_lod and config.mesh_compression:
+    print(f"  Draco:      {'启用' if config.enable_draco else '禁用'}", end="")
+    if config.enable_lod and config.enable_draco:
         print("  (LOD0 不压缩, LOD1+ 压缩)", end="")
+    print()
+
+    print(f"  纹理压缩:   {'启用' if config.enable_texture_compress else '禁用'}", end="")
+    if config.enable_texture_compress:
+        print("  (KTX2/Basis Universal)", end="")
+    print()
+
+    print(f"  并行度:     {config.threads} 进程")
     print()
 
     if config.enable_lod and config.enable_simplify:
         print("  联动模式:   A — 多级自适应简化")
         for i, ratio in enumerate(config.lod_levels):
-            draco = "否" if (i == 0 and config.mesh_compression) else ("是" if config.mesh_compression else "否")
-            level_name = ["Root(LOD2)", "Mid(LOD1)", "Leaf(LOD0)"][min(i, 2)] if len(config.lod_levels) == 3 else f"Level{i}"
+            draco = "否" if (i == 0 and config.enable_draco) else ("是" if config.enable_draco else "否")
             if i == 0:
                 level_name = f"Leaf(LOD{i})"
             elif i == len(config.lod_levels) - 1:

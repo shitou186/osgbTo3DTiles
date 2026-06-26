@@ -145,3 +145,58 @@ class TestPackGlb:
         bin_data = b"\x01\x02\x03"  # 非 4 倍数 BIN
         glb = pack_glb(gltf_json, bin_data)
         assert len(glb) % 4 == 0
+
+
+class TestGeometricErrorLevelDecay:
+    """测试基于文件名层级标识的 geometricError 指数衰减。"""
+
+    def test_extract_level_from_contextcapture_filename(self):
+        from osgb2tiles.structure import extract_level_from_filename, StructureType
+        assert extract_level_from_filename("Tile_+000_+000_L20_0000t3_0025.glb", StructureType.CONTEXT_CAPTURE) == 20
+        assert extract_level_from_filename("Tile_+000_+000_L21_00010t2_001.glb", StructureType.CONTEXT_CAPTURE) == 21
+        assert extract_level_from_filename("Tile_p0000_p0000_0253.glb", StructureType.CONTEXT_CAPTURE) is None
+        assert extract_level_from_filename("Data_L15_+002_+003.osgb", StructureType.CONTEXT_CAPTURE) == 15
+
+    def test_level_decay_produces_staircase(self):
+        """模拟 range_max 相同场景：L20 和 L21 的 geometricError 应呈阶梯递减。"""
+        from osgb2tiles.structure import compute_level_based_error
+        base_error = 1000.0
+        base_level = 20
+        scale = 1.0
+
+        # L20: decay_factor = 0.6^0 = 1.0
+        error_l20 = max(base_error * (0.6 ** (20 - base_level)) * scale, 0.01)
+        # L21: decay_factor = 0.6^1 = 0.6
+        error_l21 = max(base_error * (0.6 ** (21 - base_level)) * scale, 0.01)
+        # L22: decay_factor = 0.6^2 = 0.36
+        error_l22 = max(base_error * (0.6 ** (22 - base_level)) * scale, 0.01)
+
+        assert error_l20 == 1000.0
+        assert abs(error_l21 - 600.0) < 0.01
+        assert abs(error_l22 - 360.0) < 0.01
+        # 严格单调递减
+        assert error_l20 > error_l21 > error_l22 > 0.01
+
+    def test_level_decay_minimum_clamp(self):
+        """极高层级不应低于 0.01。"""
+        base_error = 1000.0
+        base_level = 20
+        # L40: 0.6^20 ≈ 0.000036 → 1000 * 0.000036 = 0.036
+        error_l40 = max(base_error * (0.6 ** (40 - base_level)), 0.01)
+        assert error_l40 >= 0.01
+
+    def test_root_level_uses_base_error(self):
+        """根节点（level == base_level）应使用原始 base_error。"""
+        base_error = 1000.0
+        base_level = 20
+        # level == base_level → decay_factor = 0.6^0 = 1.0
+        error = max(base_error * (0.6 ** (base_level - base_level)), 0.01)
+        assert error == 1000.0
+
+    def test_range_max_variation_uses_original(self):
+        """当 range_max 有变化时，应直接使用 range_max * scale。"""
+        from osgb2tiles.osgb_parser import compute_geometric_error, PageLODInfo
+        lod1 = PageLODInfo(range_min=0, range_max=500, child_tile_path="a.osgb", center=(0,0,0), radius=10)
+        lod2 = PageLODInfo(range_min=0, range_max=1000, child_tile_path="b.osgb", center=(0,0,0), radius=10)
+        assert compute_geometric_error(lod1) == 500.0
+        assert compute_geometric_error(lod2) == 1000.0

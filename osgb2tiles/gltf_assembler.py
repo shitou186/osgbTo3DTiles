@@ -30,8 +30,12 @@ class GlbAssembler:
         self,
         meshes: List[OsgeMesh],
         tile_name: str = "tile",
+        use_draco: Optional[bool] = None,
     ) -> Tuple[dict, bytes]:
         """构建 glTF 2.0 JSON 结构与 BIN 数据。
+
+        Args:
+            use_draco: 是否使用 Draco 压缩。None 时使用 config.mesh_compression。
 
         Returns:
             (gltf_json_dict, bin_bytes)
@@ -83,7 +87,7 @@ class GlbAssembler:
                 )
 
             primitive = self._process_mesh(
-                mesh, bin_buffer, buffer_views, accessors, gltf
+                mesh, bin_buffer, buffer_views, accessors, gltf, use_draco=use_draco
             )
             primitive["material"] = material_idx
             mesh_primitives.append(primitive)
@@ -110,14 +114,32 @@ class GlbAssembler:
         buffer_views: List[dict],
         accessors: List[dict],
         gltf: dict,
+        use_draco: Optional[bool] = None,
     ) -> dict:
-        """处理单个网格，写入 buffer 并返回 primitive 描述。"""
+        """处理单个网格，写入 buffer 并返回 primitive 描述。
+
+        Args:
+            use_draco: 是否使用 Draco 压缩。None 时使用 config.mesh_compression。
+        """
         primitive: Dict = {"attributes": {}, "extensions": {}}
 
-        if self.config.mesh_compression:
+        if use_draco is None:
+            use_draco = self.config.mesh_compression
+
+        if use_draco:
             return self._process_mesh_draco(mesh, bin_buffer, buffer_views, accessors, primitive, gltf)
 
-        # ---- POSITION ----
+        return self._process_mesh_raw(mesh, bin_buffer, buffer_views, accessors, primitive)
+
+    def _process_mesh_raw(
+        self,
+        mesh: OsgeMesh,
+        bin_buffer: BytesIO,
+        buffer_views: List[dict],
+        accessors: List[dict],
+        primitive: dict,
+    ) -> dict:
+        """原始（非 Draco）网格处理。"""
         if len(mesh.vertices) > 0:
             bv_idx = self._write_buffer_view(
                 bin_buffer, buffer_views, mesh.vertices.tobytes(), target=34962
@@ -194,6 +216,9 @@ class GlbAssembler:
                 "Draco 压缩需要 DracoPy 库。请安装：pip install DracoPy"
             )
 
+        if len(mesh.vertices) == 0 or len(mesh.indices) == 0:
+            return self._process_mesh_raw(mesh, bin_buffer, buffer_views, accessors, primitive)
+
         draco_data = DracoPy.encode(
             points=mesh.vertices.astype(np.float64) if len(mesh.vertices) > 0 else [],
             faces=mesh.indices.reshape(-1, 3).astype(np.int64) if len(mesh.indices) > 0 else None,
@@ -265,8 +290,10 @@ class GlbAssembler:
         if not primitive["extensions"]:
             del primitive["extensions"]
 
-        gltf["extensionsUsed"].append("KHR_draco_mesh_compression")
-        gltf["extensionsRequired"].append("KHR_draco_mesh_compression")
+        if "KHR_draco_mesh_compression" not in gltf["extensionsUsed"]:
+            gltf["extensionsUsed"].append("KHR_draco_mesh_compression")
+        if "KHR_draco_mesh_compression" not in gltf["extensionsRequired"]:
+            gltf["extensionsRequired"].append("KHR_draco_mesh_compression")
 
         return primitive
 
@@ -283,18 +310,21 @@ class GlbAssembler:
         if raw is None:
             return
 
+        # LOD 级别使用对应纹理尺寸，否则使用全局配置
+        max_size = mesh.lod_texture_size if mesh.lod_texture_size else self.config.max_texture_size
+
         # 如果原始数据已是目标格式且未超限，直接复用，避免重复编码损失质量
         if self.config.texture_format == TextureFormat.JPG and self._is_jpeg(raw):
-            if self._jpeg_within_size(raw, self.config.max_texture_size):
+            if self._jpeg_within_size(raw, max_size):
                 encoded = raw
             else:
                 encoded = encode_texture(
-                    resize_texture(raw, self.config.max_texture_size),
+                    resize_texture(raw, max_size),
                     self.config.texture_format,
                 )
         else:
             encoded = encode_texture(
-                resize_texture(raw, self.config.max_texture_size),
+                resize_texture(raw, max_size),
                 self.config.texture_format,
             )
 
@@ -356,7 +386,8 @@ class GlbAssembler:
         }
 
         # 背面裁切 / 双面
-        if self.config.force_double_sided:
+        # Draco 压缩可能导致顶点重排引起绕序反转，强制启用双面渲染
+        if self.config.force_double_sided or self.config.mesh_compression:
             material["doubleSided"] = True
         else:
             material["doubleSided"] = not self.config.back_face_culling

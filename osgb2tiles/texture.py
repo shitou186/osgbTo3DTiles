@@ -77,20 +77,21 @@ def encode_texture(
 def _encode_ktx2(img: Image.Image) -> bytes:
     """将图像编码为 KTX2/Basis Universal 格式。
 
-    生产环境需调用 toktx 命令行工具或 basis_universal SDK。
-    此处提供 subprocess 调用 toktx 的实现框架。
+    调用 toktx 命令行工具完成转码，使用 tempfile 管理中间文件。
     """
     import subprocess
     import tempfile
     import os
 
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_in:
-        img.save(tmp_in, format="PNG")
-        tmp_in_path = tmp_in.name
-
-    tmp_out_path = tmp_in_path.replace(".png", ".ktx2")
-
+    tmp_in_path = None
+    tmp_out_path = None
     try:
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_in:
+            img.save(tmp_in, format="PNG")
+            tmp_in_path = tmp_in.name
+
+        tmp_out_path = tmp_in_path.replace(".png", ".ktx2")
+
         cmd = [
             "toktx",
             "--t2",                   # 输出 KTX2
@@ -108,8 +109,9 @@ def _encode_ktx2(img: Image.Image) -> bytes:
             "未找到 toktx 工具。请安装 KTX-Software：https://github.com/KhronosGroup/KTX-Software"
         )
     finally:
-        os.unlink(tmp_in_path)
-        if os.path.exists(tmp_out_path):
+        if tmp_in_path and os.path.exists(tmp_in_path):
+            os.unlink(tmp_in_path)
+        if tmp_out_path and os.path.exists(tmp_out_path):
             os.unlink(tmp_out_path)
 
 
@@ -119,3 +121,28 @@ def get_mime_type(fmt: TextureFormat) -> str:
         TextureFormat.WEBP: "image/webp",
         TextureFormat.KTX2: "image/ktx2",
     }[fmt]
+
+
+def encode_texture_batch(
+    items: list,
+    max_workers: int = 4,
+) -> list:
+    """批量编码纹理，支持 ProcessPoolExecutor 并行。
+
+    Args:
+        items: [(image_data, format, quality), ...] 元组列表
+        max_workers: 最大并行工作进程数
+
+    Returns:
+        编码后的字节列表
+    """
+    if len(items) <= 1:
+        return [encode_texture(data, fmt, q) for data, fmt, q in items]
+
+    from concurrent.futures import ProcessPoolExecutor
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(encode_texture, data, fmt, q)
+            for data, fmt, q in items
+        ]
+        return [f.result() for f in futures]

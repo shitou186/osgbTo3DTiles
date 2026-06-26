@@ -25,6 +25,7 @@ class SimplifyResult:
     triangle_ratio: float   # 实际三角形比例
     texture_data: Optional[bytes] = None
     texture_path: Optional[str] = None
+    lod_texture_size: Optional[int] = None  # LOD 级别对应的纹理尺寸
 
 
 def simplify_mesh(
