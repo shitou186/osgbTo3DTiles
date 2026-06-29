@@ -318,15 +318,21 @@ class GlbAssembler:
             if self._jpeg_within_size(raw, max_size):
                 encoded = raw
             else:
-                encoded = encode_texture(
-                    resize_texture(raw, max_size),
-                    self.config.texture_format,
-                )
+                # 缩放时直接输出 JPEG，避免 JPEG→PNG→JPEG roundtrip
+                encoded = resize_texture(raw, max_size, target_fmt="JPEG")
         else:
-            encoded = encode_texture(
-                resize_texture(raw, max_size),
-                self.config.texture_format,
-            )
+            # 缩放时直接输出目标格式（KTX2 除外，需先缩放为 PNG 再用 toktx 编码）
+            resize_fmt = {
+                TextureFormat.JPG: "JPEG",
+                TextureFormat.WEBP: "WEBP",
+            }.get(self.config.texture_format, "PNG")
+            resized = resize_texture(raw, max_size, target_fmt=resize_fmt)
+            if self.config.texture_format == TextureFormat.KTX2:
+                # KTX2 需要 toktx 子进程编码，输入为 PNG
+                encoded = encode_texture(resized, self.config.texture_format)
+            else:
+                # JPEG/WEBP 已在 resize 时编码完成
+                encoded = resized
 
         bv_idx = self._write_buffer_view(
             bin_buffer, buffer_views, encoded, target=None

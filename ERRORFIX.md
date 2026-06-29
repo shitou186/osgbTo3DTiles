@@ -149,9 +149,10 @@ else:
 
 | 文件 | 修改内容 |
 |------|----------|
-| `tileset_builder.py` | ECEF 矩阵 `.T.flatten()` 列优先存储；添加进度打印 |
-| `osgb_parser.py` | Z-up→Y-up 坐标交换；嵌入纹理提取；多纹理按材质名匹配；统一法线检测；V 坐标翻转 |
+| `tileset_builder.py` | ECEF 矩阵 `.T.flatten()` 列优先存储 |
+| `osgb_parser.py` | 嵌入纹理提取；多纹理按材质名匹配；统一法线检测；V 坐标翻转 |
 | `gltf_assembler.py` | 多材质支持；`_attach_texture()` 替代 `_process_textures()`；`baseColorTexture` 显式关联；JPEG 直通优化 |
 | `obj_parser.py` | `ObjMesh` 添加 `material_name` 字段 |
+| `metadata.py` | `local_to_ecef_transform()` 实现 ENU → ECEF 变换 |
 | `Makefile` | 新增，提供 `make clean/test/run` 工作流 |
 | `run.sh` | 每次运行前自动清除 `__pycache__` |

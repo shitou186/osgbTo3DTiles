@@ -17,8 +17,14 @@ def load_texture(texture_path: str) -> Optional[bytes]:
         return None
 
 
-def resize_texture(image_data: bytes, max_size: int) -> bytes:
-    """将纹理缩放到不超过 max_size 的最大 2 的幂次尺寸。"""
+def resize_texture(image_data: bytes, max_size: int, target_fmt: str = None) -> bytes:
+    """将纹理缩放到不超过 max_size 的最大 2 的幂次尺寸。
+
+    Args:
+        image_data: 原始图像字节
+        max_size: 最大尺寸
+        target_fmt: 目标格式（"JPEG"/"WEBP"/"PNG"），用于避免不必要的格式转换
+    """
     img = Image.open(io.BytesIO(image_data))
     w, h = img.size
 
@@ -35,8 +41,16 @@ def resize_texture(image_data: bytes, max_size: int) -> bytes:
     new_h = next_power_of_2(h)
     img = img.resize((new_w, new_h), Image.LANCZOS)
 
+    # 直接以目标格式保存，避免 JPEG→PNG→JPEG 的无损 roundtrip
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
+    if target_fmt == "JPEG":
+        if img.mode == "RGBA":
+            img = img.convert("RGB")
+        img.save(buf, format="JPEG", quality=85, optimize=True)
+    elif target_fmt == "WEBP":
+        img.save(buf, format="WEBP", quality=85, method=4)
+    else:
+        img.save(buf, format="PNG")
     return buf.getvalue()
 
 
@@ -123,26 +137,3 @@ def get_mime_type(fmt: TextureFormat) -> str:
     }[fmt]
 
 
-def encode_texture_batch(
-    items: list,
-    max_workers: int = 4,
-) -> list:
-    """批量编码纹理，支持 ProcessPoolExecutor 并行。
-
-    Args:
-        items: [(image_data, format, quality), ...] 元组列表
-        max_workers: 最大并行工作进程数
-
-    Returns:
-        编码后的字节列表
-    """
-    if len(items) <= 1:
-        return [encode_texture(data, fmt, q) for data, fmt, q in items]
-
-    from concurrent.futures import ProcessPoolExecutor
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = [
-            executor.submit(encode_texture, data, fmt, q)
-            for data, fmt, q in items
-        ]
-        return [f.result() for f in futures]

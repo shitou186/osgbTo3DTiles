@@ -26,6 +26,7 @@ Draco 条件联动（LOD 模式）：
 """
 
 import gc
+import math
 import os
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -126,6 +127,10 @@ class OptimizationPipeline:
                 from .texture import load_texture
                 mesh.texture_data = load_texture(tex_path)
 
+        # 逐顶点坐标纠正
+        if self.ctx.config.precise_coords:
+            self._apply_precise_coords(meshes)
+
         config = self.ctx.config
 
         if config.enable_lod:
@@ -206,7 +211,7 @@ class OptimizationPipeline:
             self.ctx.tile_counter += 1
             suffix = f"lod{level_idx}"
             tile_name_str = f"{work.tile_name}_{suffix}_{self.ctx.tile_counter:04d}{self._tile_extension}"
-            tile_rel_path = os.path.join("tiles", tile_name_str)
+            tile_rel_path = tile_name_str
 
             # 几何误差
             if level_idx == 0:
@@ -264,7 +269,7 @@ class OptimizationPipeline:
 
         self.ctx.tile_counter += 1
         tile_name_str = f"{work.tile_name}_{self.ctx.tile_counter:04d}{self._tile_extension}"
-        tile_rel_path = os.path.join("tiles", tile_name_str)
+        tile_rel_path = tile_name_str
 
         tri_count = sum(len(m.indices) // 3 for m in meshes)
         draco_tag = "+Draco" if use_draco else ""
@@ -364,6 +369,67 @@ class OptimizationPipeline:
                 ]
             }
         return {"sphere": [0.0, 0.0, 0.0, 1.0]}
+
+    def _apply_precise_coords(self, meshes):
+        """逐顶点坐标纠正：将顶点从源坐标系精确转换为 ECEF 局部 ENU。
+
+        与单一 ECEF 变换不同，此方法对每个顶点独立执行完整的
+        CRS → WGS84 → 大地水准面纠正 → ECEF → 局部 ENU 变换，
+        消除投影畸变带来的位置误差。
+        """
+        from pyproj import Transformer
+
+        metadata = self.ctx.metadata
+        srs = metadata.srs
+
+        # 创建坐标变换器
+        crs_to_wgs84 = Transformer.from_crs(srs, "EPSG:4326", always_xy=True)
+        wgs84_to_ecef = Transformer.from_crs("EPSG:4326", "EPSG:4978", always_xy=True)
+
+        # 原点 ECEF 坐标（用于 ENU 参考点）
+        origin_ecef = wgs84_to_ecef.transform(
+            metadata.origin_lon, metadata.origin_lat, metadata.origin_height
+        )
+
+        # ENU 旋转矩阵（ECEF → ENU）
+        lon_rad = math.radians(metadata.origin_lon)
+        lat_rad = math.radians(metadata.origin_lat)
+        cos_lat, sin_lat = math.cos(lat_rad), math.sin(lat_rad)
+        cos_lon, sin_lon = math.cos(lon_rad), math.sin(lon_rad)
+
+        for mesh in meshes:
+            if len(mesh.vertices) == 0:
+                continue
+
+            verts = mesh.vertices.copy()
+
+            # CRS 轴顺序修正：(Northing, Easting) → (Easting, Northing)
+            if metadata.swap_xy:
+                verts[:, [0, 1]] = verts[:, [1, 0]]
+
+            # 1. 源坐标系 → WGS84（批量转换，极快）
+            lon, lat = crs_to_wgs84.transform(verts[:, 0], verts[:, 1])
+            h = verts[:, 2]
+
+            # 2. 大地水准面纠正
+            if abs(metadata.geoid_offset) > 0.01:
+                h = h + metadata.geoid_offset
+
+            # 3. WGS84 → ECEF
+            ecef_x, ecef_y, ecef_z = wgs84_to_ecef.transform(lon, lat, h)
+
+            # 4. ECEF → 局部 ENU（相对于原点）
+            dx = ecef_x - origin_ecef[0]
+            dy = ecef_y - origin_ecef[1]
+            dz = ecef_z - origin_ecef[2]
+
+            enu_x = -sin_lon * dx + cos_lon * dy
+            enu_y = -sin_lat * cos_lon * dx - sin_lat * sin_lon * dy + cos_lat * dz
+            enu_z = cos_lat * cos_lon * dx + cos_lat * sin_lon * dy + sin_lat * dz
+
+            mesh.vertices[:, 0] = enu_x
+            mesh.vertices[:, 1] = enu_y
+            mesh.vertices[:, 2] = enu_z
 
 
 # ── 并发调度器 ──

@@ -29,12 +29,12 @@ class TilesetBuilder:
         self.metadata = metadata
         self.structure_type = structure_type
         self.ecef_matrix = local_to_ecef_transform(metadata)
-        self.parser = OsgeBinaryParser(config)
+        self.parser = OsgeBinaryParser(config, swap_xy=metadata.swap_xy)
         self.assembler = GlbAssembler(config)
         self.tile_counter = 0
+        self.total_tiles = 0  # 并行模式下聚合的瓦片总数
         self._root_name_length = 0
         self._base_level = 0  # 文件名中 _Lxx_ 的最小层级
-        self._range_max_uniform = True  # 所有 PagedLOD 的 range_max 是否相同
 
     def build(self, root_osgb: str, output_dir: str):
         """主入口：从根 OSGB 文件构建完整 3D Tiles 输出。
@@ -59,8 +59,8 @@ class TilesetBuilder:
         print(f"  解析根文件: {os.path.basename(root_osgb)}")
         root_node = self.parser.parse_file(root_osgb)
 
-        # 预扫描：提取基准层级 & 检测 range_max 是否一致
-        self._base_level, self._range_max_uniform = self._scan_level_range(root_node)
+        # 预扫描：提取基准层级
+        self._base_level = self._scan_base_level(root_node)
 
         # 收集顶层瓦片组，为每个生成独立子 tileset
         osgb_dir = os.path.dirname(root_osgb)
@@ -90,6 +90,8 @@ class TilesetBuilder:
 
         sub_tileset_refs = []
 
+        # 构建子任务参数列表
+        sub_tasks = []
         for child_osgb_path in top_level_paths:
             tile_name = os.path.splitext(os.path.basename(child_osgb_path))[0]
             tile_subdir = os.path.join("Data", tile_name)
@@ -100,38 +102,43 @@ class TilesetBuilder:
             if os.path.exists(alt_path):
                 child_osgb_path = alt_path
 
-            child_node = self.parser.parse_file(child_osgb_path)
-            self._load_mesh_textures(child_node, os.path.dirname(child_osgb_path))
-            sub_tile = self._process_node(
-                child_node, child_osgb_path, output_dir, depth=0,
-                tile_subdir=tile_subdir,
-            )
+            sub_tasks.append((child_osgb_path, tile_subdir, output_dir))
 
-            # 生成子 tileset.json（移除 transform，避免重复坐标变换）
-            sub_tile.pop("transform", None)
-            sub_tileset = {
-                "asset": {
-                    "version": self.config.tiles_version,
-                    "generator": "OSGB2Tiles v1.0",
-                    "gltfUpAxis": "Z",
-                },
-                "geometricError": sub_tile.get("geometricError", 1000),
-                "root": sub_tile,
-            }
-            sub_ts_path = os.path.join(output_dir, tile_subdir, "tileset.json")
-            with open(sub_ts_path, "w", encoding="utf-8") as f:
-                json.dump(sub_tileset, f, indent=2, ensure_ascii=False)
+        # 并行处理子 tileset
+        max_workers = self.config.threads
+        total_tiles = 0
+        if len(sub_tasks) > 1 and max_workers > 1:
+            from concurrent.futures import ProcessPoolExecutor, as_completed
+            print(f"  并行处理 {len(sub_tasks)} 个子 tileset（{max_workers} 进程）")
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {}
+                for child_osgb_path, tile_subdir, out_dir in sub_tasks:
+                    future = executor.submit(
+                        _process_sub_tileset,
+                        child_osgb_path, tile_subdir, out_dir,
+                        self.config, self.metadata, self.structure_type,
+                        self.ecef_matrix, self._base_level, self._root_name_length,
+                    )
+                    future_map[future] = tile_subdir
 
-            sub_tileset_refs.append({
-                "boundingVolume": sub_tile.get("boundingVolume", {}),
-                "geometricError": sub_tile.get("geometricError", 1000),
-                "content": {"uri": f"./{tile_subdir}/tileset.json"},
-            })
-
-            glb_count = self._count_glb_files(sub_tile)
-            print(f"  子 tileset: {tile_subdir}/ ({glb_count} 瓦片)")
+                for future in as_completed(future_map):
+                    tile_subdir = future_map[future]
+                    try:
+                        ref, count = future.result()
+                        sub_tileset_refs.append(ref)
+                        total_tiles += count
+                        print(f"  子 tileset: {tile_subdir}/ ({count} 瓦片)")
+                    except Exception as e:
+                        print(f"  [错误] 子 tileset {tile_subdir}/ 处理失败: {e}", file=sys.stderr)
+        else:
+            for child_osgb_path, tile_subdir, out_dir in sub_tasks:
+                ref, count = self._process_single_sub_tileset(child_osgb_path, tile_subdir, out_dir)
+                sub_tileset_refs.append(ref)
+                total_tiles += count
+                print(f"  子 tileset: {tile_subdir}/ ({count} 瓦片)")
 
         # 生成根 tileset.json
+        self.total_tiles = total_tiles
         # 从子 tileset 误差推导根误差，确保父子递减（2:1）
         if sub_tileset_refs:
             root_error = max(ref["geometricError"] for ref in sub_tileset_refs) * 2.0
@@ -144,6 +151,7 @@ class TilesetBuilder:
             "asset": {
                 "version": self.config.tiles_version,
                 "generator": "OSGB2Tiles v1.0",
+                "gltfUpAxis": "Z",
             },
             "geometricError": root_error,
             "root": {
@@ -154,8 +162,8 @@ class TilesetBuilder:
             },
         }
 
-        # 根节点应用 ECEF 变换
-        if self.config.ecef_transform:
+        # 根节点应用 ECEF 变换（precise_coords 模式下顶点已在 ENU，跳过）
+        if self.config.ecef_transform and not self.config.precise_coords:
             root_tileset["root"]["transform"] = self.ecef_matrix.T.flatten().tolist()
 
         tileset_path = os.path.join(output_dir, "tileset.json")
@@ -319,36 +327,29 @@ class TilesetBuilder:
             tile["geometricError"] = max(base_error * (0.5 ** offset), 0.01)
         elif node.page_lods:
             if depth == 0:
-                # 子 tileset 根节点：从包围体计算误差（比子节点 L17 粗一级）
-                # 保证与 L17 等子节点形成 2:1 的 geometricError 递减
-                bv = tile.get("boundingVolume", {})
-                if "box" in bv:
-                    b = bv["box"]
-                    base_error = (abs(b[3]) + abs(b[7]) + abs(b[11])) / 3.0
-                elif "sphere" in bv:
-                    base_error = bv["sphere"][3]
-                else:
-                    base_error = 100.0
-                tile["geometricError"] = max(base_error * 2.0, 0.01)
+                # 子 tileset 根节点：使用 range_max 计算误差
+                # 根 tileset.json 会在 build() 中额外乘 2.0 保证父子递减
+                tile["geometricError"] = compute_geometric_error(
+                    node.page_lods[0], self.config.geometric_error_scale
+                )
             else:
                 # 根节点或无 _Lxx_ → 使用 range_max 作为回退
                 tile["geometricError"] = compute_geometric_error(
                     node.page_lods[0], self.config.geometric_error_scale
                 )
         else:
-            # 叶子节点
-            level = extract_level_from_filename(
-                os.path.basename(osgb_path), self.structure_type, self._root_name_length
-            )
-            if level is not None:
-                tile["geometricError"] = compute_level_based_error(
-                    level, self.config.geometric_error_scale
-                )
+            # 叶子节点：从包围体计算误差（与参考工具一致：max(dimensions)/2）
+            bv = tile.get("boundingVolume", {})
+            if "box" in bv:
+                b = bv["box"]
+                tile["geometricError"] = max(abs(b[3]), abs(b[7]), abs(b[11]))
+            elif "sphere" in bv:
+                tile["geometricError"] = bv["sphere"][3]
             else:
                 tile["geometricError"] = max(100.0 / (depth + 1), 0.01)
 
-        # 3. 根节点应用 ECEF 变换
-        if depth == 0 and self.config.ecef_transform:
+        # 3. 根节点应用 ECEF 变换（precise_coords 模式下顶点已在 ENU，跳过）
+        if depth == 0 and self.config.ecef_transform and not self.config.precise_coords:
             tile["transform"] = self.ecef_matrix.T.flatten().tolist()
 
         # 4. 细化模式
@@ -434,6 +435,39 @@ class TilesetBuilder:
 
         return tile
 
+    def _process_single_sub_tileset(self, child_osgb_path, tile_subdir, output_dir):
+        """处理单个子 tileset（串行模式）。返回 (ref_dict, glb_count)。"""
+        child_node = self.parser.parse_file(child_osgb_path)
+        self._load_mesh_textures(child_node, os.path.dirname(child_osgb_path))
+        sub_tile = self._process_node(
+            child_node, child_osgb_path, output_dir, depth=0,
+            tile_subdir=tile_subdir,
+        )
+
+        # 生成子 tileset.json（移除 transform，避免重复坐标变换）
+        sub_tile.pop("transform", None)
+        sub_tileset = {
+            "asset": {
+                "version": self.config.tiles_version,
+                "generator": "OSGB2Tiles v1.0",
+                "gltfUpAxis": "Z",
+            },
+            "geometricError": sub_tile.get("geometricError", 1000),
+            "root": sub_tile,
+        }
+        sub_ts_path = os.path.join(output_dir, tile_subdir, "tileset.json")
+        with open(sub_ts_path, "w", encoding="utf-8") as f:
+            json.dump(sub_tileset, f, indent=2, ensure_ascii=False)
+
+        glb_count = self._count_glb_files(sub_tile)
+
+        ref = {
+            "boundingVolume": sub_tile.get("boundingVolume", {}),
+            "geometricError": sub_tile.get("geometricError", 1000),
+            "content": {"uri": f"./{tile_subdir}/tileset.json"},
+        }
+        return ref, glb_count
+
     # ─────────────────────────────────────────────
     #  阶段一：四叉树重构辅助方法
     # ─────────────────────────────────────────────
@@ -514,30 +548,18 @@ class TilesetBuilder:
             os.path.basename(child_tile_path), self.structure_type, self._root_name_length
         )
 
-    def _scan_level_range(self, node: OsgeTileNode) -> tuple:
-        """预扫描瓦片树，提取基准层级和 range_max 一致性。
-
-        Returns:
-            (base_level, range_max_is_uniform)
-        """
+    def _scan_base_level(self, node: OsgeTileNode) -> int:
+        """预扫描瓦片树，提取基准层级（最小 _Lxx_ 值）。"""
         levels = []
-        range_max_values = []
-        self._collect_scan_data(node, levels, range_max_values)
+        self._collect_scan_data(node, levels)
+        return min(levels) if levels else 0
 
-        base_level = min(levels) if levels else 0
-        uniform = len(set(range_max_values)) <= 1 if range_max_values else True
-        return base_level, uniform
-
-    def _collect_scan_data(
-        self, node: OsgeTileNode, levels: list, range_max_values: list
-    ):
-        """递归收集层级标识和 range_max 值。"""
+    def _collect_scan_data(self, node: OsgeTileNode, levels: list):
+        """递归收集层级标识。"""
         for child in node.children:
-            self._collect_scan_data(child, levels, range_max_values)
+            self._collect_scan_data(child, levels)
 
         for pagelod in node.page_lods:
-            range_max_values.append(pagelod.range_max)
-            osgb_dir = ''  # 路径在预扫描时不可用，仅需文件名
             child_path = pagelod.child_tile_path
             level = extract_level_from_filename(
                 os.path.basename(child_path), self.structure_type, self._root_name_length
@@ -618,3 +640,26 @@ class TilesetBuilder:
     def _tile_extension(self) -> str:
         """根据版本返回瓦片文件扩展名。"""
         return ".b3dm" if self.config.tiles_version == "1.0" else ".glb"
+
+
+def _process_sub_tileset(
+    child_osgb_path: str,
+    tile_subdir: str,
+    output_dir: str,
+    config: ConvertConfig,
+    metadata,
+    structure_type,
+    ecef_matrix,
+    base_level: int,
+    root_name_length: int,
+) -> tuple:
+    """子进程入口：处理单个子 tileset。
+
+    在子进程中重建 TilesetBuilder 实例，处理完整的子 tileset 树，
+    写入 tileset.json 和所有 GLB 文件，返回 (ref_dict, glb_count)。
+    """
+    builder = TilesetBuilder(config, metadata, structure_type)
+    builder._base_level = base_level
+    builder._root_name_length = root_name_length
+    builder.ecef_matrix = ecef_matrix
+    return builder._process_single_sub_tileset(child_osgb_path, tile_subdir, output_dir)

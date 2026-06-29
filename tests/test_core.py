@@ -164,16 +164,16 @@ class TestGeometricErrorLevelDecay:
         base_level = 20
         scale = 1.0
 
-        # L20: decay_factor = 0.6^0 = 1.0
-        error_l20 = max(base_error * (0.6 ** (20 - base_level)) * scale, 0.01)
-        # L21: decay_factor = 0.6^1 = 0.6
-        error_l21 = max(base_error * (0.6 ** (21 - base_level)) * scale, 0.01)
-        # L22: decay_factor = 0.6^2 = 0.36
-        error_l22 = max(base_error * (0.6 ** (22 - base_level)) * scale, 0.01)
+        # L20: decay_factor = 0.5^0 = 1.0
+        error_l20 = max(base_error * (0.5 ** (20 - base_level)) * scale, 0.01)
+        # L21: decay_factor = 0.5^1 = 0.5
+        error_l21 = max(base_error * (0.5 ** (21 - base_level)) * scale, 0.01)
+        # L22: decay_factor = 0.5^2 = 0.25
+        error_l22 = max(base_error * (0.5 ** (22 - base_level)) * scale, 0.01)
 
         assert error_l20 == 1000.0
-        assert abs(error_l21 - 600.0) < 0.01
-        assert abs(error_l22 - 360.0) < 0.01
+        assert abs(error_l21 - 500.0) < 0.01
+        assert abs(error_l22 - 250.0) < 0.01
         # 严格单调递减
         assert error_l20 > error_l21 > error_l22 > 0.01
 
@@ -181,16 +181,16 @@ class TestGeometricErrorLevelDecay:
         """极高层级不应低于 0.01。"""
         base_error = 1000.0
         base_level = 20
-        # L40: 0.6^20 ≈ 0.000036 → 1000 * 0.000036 = 0.036
-        error_l40 = max(base_error * (0.6 ** (40 - base_level)), 0.01)
+        # L40: 0.5^20 ≈ 0.00000095 → clamped to 0.01
+        error_l40 = max(base_error * (0.5 ** (40 - base_level)), 0.01)
         assert error_l40 >= 0.01
 
     def test_root_level_uses_base_error(self):
         """根节点（level == base_level）应使用原始 base_error。"""
         base_error = 1000.0
         base_level = 20
-        # level == base_level → decay_factor = 0.6^0 = 1.0
-        error = max(base_error * (0.6 ** (base_level - base_level)), 0.01)
+        # level == base_level → decay_factor = 0.5^0 = 1.0
+        error = max(base_error * (0.5 ** (base_level - base_level)), 0.01)
         assert error == 1000.0
 
     def test_range_max_variation_uses_original(self):

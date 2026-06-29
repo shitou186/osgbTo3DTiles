@@ -53,6 +53,9 @@ class ConvertConfig:
     # 输出格式版本
     tiles_version: str = "1.1"  # "1.0" (b3dm) 或 "1.1" (glb)
 
+    # 坐标精度
+    precise_coords: bool = False  # 逐顶点坐标纠正
+
     def __post_init__(self):
         """同步 enable_draco 与 mesh_compression。"""
         if self.mesh_compression and not self.enable_draco:

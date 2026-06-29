@@ -123,6 +123,14 @@ def main():
         help="3D Tiles 输出版本：1.0 (b3dm) 或 1.1 (glb，默认)",
     )
 
+    # 坐标精度
+    parser.add_argument(
+        "--precise-coords",
+        action="store_true",
+        default=False,
+        help="启用逐顶点坐标纠正（大范围场景精度更高，处理速度略慢）",
+    )
+
     # LOD 与简化参数
     parser.add_argument(
         "--enable-lod",
@@ -168,8 +176,25 @@ def main():
         default=8,
         help="并行线程数（默认 8）",
     )
+    parser.add_argument(
+        "--clean",
+        action="store_true",
+        default=False,
+        help="运行前清除 __pycache__ 等编译产物（不重装依赖）",
+    )
 
     args = parser.parse_args()
+
+    # --clean：清除编译产物
+    if args.clean:
+        import shutil
+        for pycache in ["osgb2tiles/__pycache__", "tests/__pycache__"]:
+            if os.path.isdir(pycache):
+                shutil.rmtree(pycache)
+                print(f"[clean] 已删除 {pycache}")
+        if os.path.isdir(".pytest_cache"):
+            shutil.rmtree(".pytest_cache")
+            print("[clean] 已删除 .pytest_cache")
 
     # 解析 LOD 级别
     try:
@@ -198,6 +223,7 @@ def main():
         enable_draco=args.enable_draco,
         enable_texture_compress=args.enable_texture_compress,
         tiles_version=args.format_version,
+        precise_coords=args.precise_coords,
     )
 
     try:
@@ -220,6 +246,10 @@ def main():
         metadata = parse_metadata(metadata_path)
         print(f"       坐标系: {metadata.srs}")
         print(f"       原点: ({metadata.origin_lon:.6f}, {metadata.origin_lat:.6f}, {metadata.origin_height:.2f})")
+        if abs(metadata.geoid_offset) > 0.01:
+            print(f"       大地水准面纠正: {metadata.geoid_offset:+.2f}m")
+        if metadata.swap_xy:
+            print(f"       轴顺序: (北,东) → 已自动修正为 (东,北)")
     else:
         print("[警告] 未找到 metadata.xml，使用默认元数据")
         from .metadata import OsgeMetadata
@@ -248,7 +278,7 @@ def main():
     print(f"[4/4] 转换完成!")
     print(f"       输出: {tileset_path}")
     print(f"       耗时: {elapsed:.2f}s")
-    print(f"       生成瓦片数: {builder.tile_counter}")
+    print(f"       生成瓦片数: {builder.total_tiles or builder.tile_counter}")
 
 
 def _print_pipeline_config(config: ConvertConfig):
@@ -283,6 +313,8 @@ def _print_pipeline_config(config: ConvertConfig):
     print()
 
     print(f"  并行度:     {config.threads} 进程")
+    if config.precise_coords:
+        print(f"  坐标精度:   逐顶点纠正（精确模式）")
     print()
 
     if config.enable_lod and config.enable_simplify:

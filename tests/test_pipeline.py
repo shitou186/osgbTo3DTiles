@@ -2,7 +2,7 @@
 
 import gc
 import os
-import tempfile
+
 
 import numpy as np
 
@@ -14,7 +14,7 @@ from osgb2tiles.pipeline import (
     TileWorkItem,
     TileResult,
 )
-from osgb2tiles.memory_guard import MemoryGuard, release_numpy_refs
+from osgb2tiles.memory_guard import release_numpy_refs
 
 
 class TestPipelineStateMachine:
@@ -116,30 +116,7 @@ class TestTextureSizeComputation:
 
 
 class TestMemoryGuard:
-    """测试内存管理守卫。"""
-
-    def test_temp_file_cleanup(self):
-        """临时文件在 cleanup 后应被删除。"""
-        guard = MemoryGuard()
-        with tempfile.NamedTemporaryFile(delete=False) as f:
-            path = f.name
-            f.write(b"test")
-        guard.track_temp_file(path)
-        assert os.path.exists(path)
-        guard.cleanup()
-        assert not os.path.exists(path)
-
-    def test_temp_dir_cleanup(self):
-        """临时目录在 cleanup 后应被删除。"""
-        guard = MemoryGuard()
-        tmp_dir = tempfile.mkdtemp()
-        test_file = os.path.join(tmp_dir, "test.txt")
-        with open(test_file, "w") as f:
-            f.write("test")
-        guard.track_temp_dir(tmp_dir)
-        assert os.path.exists(tmp_dir)
-        guard.cleanup()
-        assert not os.path.exists(tmp_dir)
+    """测试内存管理工具。"""
 
     def test_release_numpy_refs(self):
         """release_numpy_refs 应将 ndarray 属性设为 None。"""

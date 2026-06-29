@@ -73,8 +73,9 @@ OBJ_PAGEDLOD = 0x30
 class OsgeBinaryParser:
     """OSGB 二进制文件解析器。"""
 
-    def __init__(self, config: ConvertConfig):
+    def __init__(self, config: ConvertConfig, swap_xy: bool = False):
         self.config = config
+        self.swap_xy = swap_xy
 
     def parse_file(self, osgb_path: str) -> OsgeTileNode:
         """解析单个 OSGB 文件，返回瓦片节点树。
@@ -213,24 +214,13 @@ class OsgeBinaryParser:
                     elif need_recompute:
                         obj_mesh.normals = np.zeros_like(obj_mesh.vertices)
 
-                    # OSGB 是 Z-up，glTF 是 Y-up：交换 Y/Z 轴
-                    # glTF_X = OSGB_X, glTF_Y = OSGB_Z, glTF_Z = -OSGB_Y
-                    # [x, y, z] → [x, z, -y]
-                    vertices = obj_mesh.vertices.copy()
-                    vertices[:, [1, 2]] = vertices[:, [2, 1]]
-                    vertices[:, 2] = -vertices[:, 2]
-
-                    normals = obj_mesh.normals.copy()
-                    normals[:, [1, 2]] = normals[:, [2, 1]]
-                    normals[:, 2] = -normals[:, 2]
-
                     # glTF V 坐标原点在顶部，OBJ 在底部，需要翻转
                     uvs = obj_mesh.uvs.copy()
                     uvs[:, 1] = 1.0 - uvs[:, 1]
 
                     mesh = OsgeMesh(
-                        vertices=vertices,
-                        normals=normals,
+                        vertices=obj_mesh.vertices,
+                        normals=obj_mesh.normals,
                         uvs=uvs,
                         indices=obj_mesh.indices,
                     )
@@ -425,6 +415,13 @@ class OsgeBinaryParser:
             )
             mesh.uvs = uv_data.reshape(-1, 2).copy()
             offset += num_uvs * 8
+
+        # CRS 轴顺序修正：(Northing, Easting) → (Easting, Northing)
+        if self.swap_xy:
+            if len(mesh.vertices) > 0:
+                mesh.vertices[:, [0, 1]] = mesh.vertices[:, [1, 0]]
+            if len(mesh.normals) > 0:
+                mesh.normals[:, [0, 1]] = mesh.normals[:, [1, 0]]
 
         # 索引数组（DrawElementsUInt）
         num_indices = struct.unpack_from("<I", data, offset)[0]
